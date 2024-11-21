@@ -1,6 +1,8 @@
 Group Information:
 Number: 800787174 Name/email: Shreejan Pandey / shrepan@siue.edu
+
 Number:800802210 Name/email: Oishi Banerjee/ obanerj@siue.edu
+
 
 As required we have created the following files:
 thrust.cpp
