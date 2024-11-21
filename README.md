@@ -7,11 +7,12 @@ Number:800802210 Name/email: Oishi Banerjee/ obanerj@siue.edu
 
 As required we have created the following files:
 
-thrust.cpp
+thrust.cu
 
-singlethread.cpp
+singlethread.cu
 
-multithread.cpp
+multithread.cu
+
 
 To execute first run make and once completed you can run the code via following code template:
 
