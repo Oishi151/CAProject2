@@ -105,3 +105,5 @@ int main( int argc, char* argv[] )
 
     {
         std::stringstream ss1( argv[2] );
+    }
+}
