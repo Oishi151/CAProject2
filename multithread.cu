@@ -2,67 +2,74 @@
 #include <cstdlib>
 #include <cuda.h>
 #include <vector>
+#include <algorithm>
 
-using namespace std;
+#define BLOCK_SIZE 256
 
-// Function to generate random numbers
-void generate_random_numbers(int *array, int num_elements, int seed) {
-    srand(seed);
-    for (int i = 0; i < num_elements; ++i) {
-        array[i] = rand();
-    }
+// CUDA error checking macro
+#define CUDA_CHECK(err) { \
+    if (err != cudaSuccess) { \
+        std::cerr << "CUDA Error: " << cudaGetErrorString(err) << std::endl; \
+        exit(1); \
+    } \
 }
 
-// CUDA kernel for sorting each bucket using Thrust
-__global__ void mergeSort(int* array, int* temp, int size) 
-{
-    
+// Kernel for counting the occurrences of each bit
+__global__ void countKernel(int* input, int* counts, int n, int bit) {
+    __shared__ int localCounts[2 * BLOCK_SIZE];
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    for (int width = 1; width < size; width *= 2) 
-    {
-        if (tid < size) 
-        {
-            int left = tid * 2 * width;
-            int mid = min(left + width - 1, size - 1);
-            int right = min(left + 2 * width - 1, size - 1);
 
-            if (left <= right) 
-            {
-                int i = left;
-                int j = mid + 1;
-                int k = left;
+    localCounts[threadIdx.x] = 0;
+    localCounts[threadIdx.x + BLOCK_SIZE] = 0;
 
-                while (i <= mid && j <= right) 
-                {
-                    if (array[i] <= array[j]) 
-                    {
-                        temp[k++] = array[i++];
-                    }
-                     else 
-                    {
-                        temp[k++] = array[j++];
-                    }
-                }
-                while (i <= mid) 
-                {
-                    temp[k++] = array[i++];
-                }
+    if (tid < n) {
+        int value = input[tid];
+        int bin = (value >> bit) & 1;
+        atomicAdd(&localCounts[bin * BLOCK_SIZE + threadIdx.x], 1);
+    }
+    __syncthreads();
 
-                while (j <= right) 
-                {
-                    temp[k++] = array[j++];
-                }
-
-                for (i = left; i <= right; i++) 
-                {
-                    array[i] = temp[i];
-                }
-            }
+    // Sum counts into global memory
+    if (threadIdx.x < 2) {
+        int sum = 0;
+        for (int i = 0; i < BLOCK_SIZE; ++i) {
+            sum += localCounts[i + threadIdx.x * BLOCK_SIZE];
         }
-        __syncthreads();
+        atomicAdd(&counts[threadIdx.x], sum);
     }
 }
 
+// Kernel for prefix sum (scan) computation
+__global__ void scanKernel(int* counts, int* offsets, int n) {
+    __shared__ int temp[2];
+    int tid = threadIdx.x;
+
+    if (tid < 2) {
+        temp[tid] = counts[tid];
+    }
+    __syncthreads();
+
+    if (tid == 1) {
+        offsets[1] = temp[0];
+    }
+    if (tid == 0) {
+        offsets[0] = 0;
+    }
+    __syncthreads();
+}
+
+// Kernel for scattering elements into sorted positions
+__global__ void scatterKernel(int* input, int* output, int* offsets, int n, int bit) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (tid < n) {
+        int value = input[tid];
+        int bin = (value >> bit) & 1;
+
+        int index = atomicAdd(&offsets[bin], 1);
+        output[index] = value;
+    }
+}
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
@@ -73,83 +80,77 @@ int main(int argc, char* argv[]) {
     int num_elements = std::atoi(argv[1]);
     int seed = std::atoi(argv[2]);
 
-    // Generate random numbers
-    int *host_data = new int[num_elements];
-    generate_random_numbers(host_data, num_elements, seed);
-
-    // Allocate memory on device
-    int *device_data;
-    cudaMalloc(&device_data, num_elements * sizeof(int));
-
-    // Transfer data to device
-    cudaMemcpy(device_data, host_data, num_elements * sizeof(int), cudaMemcpyHostToDevice);
-
-    // Determine the number of threads and blocks based on the requirement
-    int threads_per_block = 256;  // You can adjust this value based on your requirement
-    int num_buckets = 1024;       // Number of buckets (You can adjust this value based on your requirement)
-    int bucket_size = (num_elements + num_buckets - 1) / num_buckets;
-
-    // Allocate memory for bucket offsets
-    int *host_bucket_offsets = new int[num_buckets];
-    int *device_bucket_offsets;
-    cudaMalloc(&device_bucket_offsets, num_buckets * sizeof(int));
-
-    // Initialize bucket offsets
-    for (int i = 0; i < num_buckets; ++i) {
-        host_bucket_offsets[i] = i * bucket_size;
+    // Generate random numbers on the host
+    std::vector<int> host_input(num_elements);
+    srand(seed);
+    for (int i = 0; i < num_elements; ++i) {
+        host_input[i] = rand();
     }
 
-    // Transfer bucket offsets to device
-    cudaMemcpy(device_bucket_offsets, host_bucket_offsets, num_buckets * sizeof(int), cudaMemcpyHostToDevice);
+    // Allocate device memory
+    int *device_input, *device_output, *device_counts, *device_offsets;
+    CUDA_CHECK(cudaMalloc(&device_input, num_elements * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&device_output, num_elements * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&device_counts, 2 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&device_offsets, 2 * sizeof(int)));
 
-    //std::cout << "Number of threads per block: " << threads_per_block << std::endl;
-    //std::cout << "Number of buckets: " << num_buckets << std::endl;
-    std::cout << "Total number of threads: " << threads_per_block * num_buckets << std::endl;
+    // Copy input data to device
+    CUDA_CHECK(cudaMemcpy(device_input, host_input.data(), num_elements * sizeof(int), cudaMemcpyHostToDevice));
 
-    /***********************************
-     *
-     create a cuda timer to time execution
-     **********************************/
-    cudaEvent_t startTotal, stopTotal;
-    float timeTotal;
-    cudaEventCreate(&startTotal);
-    cudaEventCreate(&stopTotal);
-    cudaEventRecord(startTotal, 0);
-    /***********************************
-     *
-     end of cuda timer creation
-     **********************************/
+    // Define block and grid sizes
+    int threads_per_block = BLOCK_SIZE;
+    int blocks_per_grid = (num_elements + threads_per_block - 1) / threads_per_block;
 
-    // Sort each bucket using CUDA kernel
-    mergeSort<<<num_buckets, threads_per_block>>>(device_data, device_bucket_offsets, num_elements);
+    // CUDA timer
+    cudaEvent_t start, stop;
+    float elapsed_time;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, 0));
 
-    /***********************************
-     *
-     Stop and destroy the cuda timer
-     **********************************/
-    cudaEventRecord(stopTotal, 0);
-    cudaEventSynchronize(stopTotal);
-    cudaEventElapsedTime(&timeTotal, startTotal, stopTotal);
-    cudaEventDestroy(startTotal);
-    cudaEventDestroy(stopTotal);
-    /***********************************
-     *
-     end of cuda timer destruction
-     **********************************/
-    std::cerr << "Total time in seconds: " << timeTotal / 1000.0 << std::endl;
+    // Perform radix sort (32-bit integers, 32 iterations)
+    for (int bit = 0; bit < 32; ++bit) {
+        // Reset counts
+        CUDA_CHECK(cudaMemset(device_counts, 0, 2 * sizeof(int)));
 
-    // Transfer data back to host
-    cudaMemcpy(host_data, device_data, num_elements * sizeof(int), cudaMemcpyDeviceToHost);
+        // Count occurrences of each bit
+        countKernel<<<blocks_per_grid, threads_per_block>>>(device_input, device_counts, num_elements, bit);
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Print sorted numbers (commented out for large arrays)
-    // for (int i = 0; i < num_elements; ++i) {
-    //     std::cout << host_data[i] << " ";
-    // }
-    std::cout << std::endl;
+        // Compute offsets
+        scanKernel<<<1, 2>>>(device_counts, device_offsets, 2);
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    delete[] host_data;
-    delete[] host_bucket_offsets;
-    cudaFree(device_data);
-    cudaFree(device_bucket_offsets);
+        // Scatter elements into sorted positions
+        scatterKernel<<<blocks_per_grid, threads_per_block>>>(device_input, device_output, device_offsets, num_elements, bit);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        // Swap input and output
+        std::swap(device_input, device_output);
+    }
+
+    // Stop timer
+    CUDA_CHECK(cudaEventRecord(stop, 0));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start, stop));
+
+    // Copy sorted data back to host
+    CUDA_CHECK(cudaMemcpy(host_input.data(), device_input, num_elements * sizeof(int), cudaMemcpyDeviceToHost));
+
+    std::cerr << "Elapsed time: " << elapsed_time / 1000.0f << " seconds" << std::endl;
+
+    // Validate sorting
+    if (std::is_sorted(host_input.begin(), host_input.end())) {
+        std::cout << "Array sorted successfully." << std::endl;
+    } else {
+        std::cerr << "Sorting failed!" << std::endl;
+    }
+
+    // Free device memory
+    cudaFree(device_input);
+    cudaFree(device_output);
+    cudaFree(device_counts);
+    cudaFree(device_offsets);
+
     return 0;
 }
