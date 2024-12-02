@@ -9,7 +9,7 @@ using namespace std;
 /**********************************************************
  * **********************************************************
  *
- error checking stufff
+ error checking stuff
  ***********************************************************
  ***********************************************************/
 // Enable this for error checking
@@ -74,21 +74,14 @@ int * makeRandArray( const int size, const int seed ) {
     return array;
 }
 
-// Kernel function (not needed for Thrust sort, included for consistency)
-__global__ void matavgKernel( ... )
-{
-}
-
 int main( int argc, char* argv[] )
 {
-    int * array;
-    int size, seed;
-    bool printSorted = false;
-
-    if( argc < 4 ){
-        std::cerr << "usage: " << argv[0] << " [amount of random nums to generate] [seed value for rand] [1 to print sorted array, 0 otherwise]" << std::endl;
+    if( argc != 3 ){
+        std::cerr << "usage: " << argv[0] << " [number of random integers to generate] [seed value for random number generation]" << std::endl;
         exit(-1 );
     }
+
+    int size, seed;
 
     {
         std::stringstream ss1( argv[1] );
@@ -100,17 +93,8 @@ int main( int argc, char* argv[] )
         ss1 >> seed;
     }
 
-    int sortPrint;
-    {
-        std::stringstream ss1( argv[3] );
-        ss1 >> sortPrint;
-    }
-
-    if( sortPrint == 1 )
-        printSorted = true;
-
     // get the random numbers
-    array = makeRandArray( size, seed );
+    int *array = makeRandArray(size, seed);
 
     /***********************************
      *
@@ -126,36 +110,13 @@ int main( int argc, char* argv[] )
      end of cuda timer creation
      **********************************/
 
-    /////////////////////////////////////////////////////////////////////
-    /////////////////////// YOUR CODE HERE
-    ///////////////////////
-    /////////////////////////////////////////////////////////////////////
-    /*
-     *
-     *
-     *
-     *
-     *
-     *
-     *
-     *
-     You need to implement your kernel as a function at the top of this file.
-     Here you must
-     1) allocate device memory
-     2) set up the grid and block sizes
-     3) call your kenrnel
-     4) get the result back from the GPU
-     * to use the error checking code, wrap any cudamalloc functions as follows:
-     *
-     *
-     *
-     CudaSafeCall( cudaMalloc( &pointer_to_a_device_pointer, length_of_array * sizeof( int ) ) );
-     * Also, place the following function call immediately after you call your kernel
-     * ( or after any other cuda call that you think might be causing an error )
-     CudaCheckError();
-     */
+    // Transfer data to device
     thrust::device_vector<int> device_data(array, array + size);
+
+    // Sort using Thrust
     thrust::sort(device_data.begin(), device_data.end());
+
+    // Transfer data back to host
     thrust::copy(device_data.begin(), device_data.end(), array);
 
     /***********************************
@@ -172,15 +133,12 @@ int main( int argc, char* argv[] )
      end of cuda timer destruction
      **********************************/
     std::cerr << "Total time in seconds: " << timeTotal / 1000.0 << std::endl;
-    if( printSorted ){
-        ///////////////////////////////////////////////
-        /// Your code to print the sorted array here //
-        ///////////////////////////////////////////////
-        for (int i = 0; i < size; ++i) {
-            std::cout << array[i] << " ";
-        }
-        std::cout << std::endl;
-    }
+
+    // Print the sorted array
+    //for (int i = 0; i < size; ++i) {
+        //std::cout << array[i] << " ";
+    //}
+    std::cout << std::endl;
 
     delete[] array;
     return 0;
