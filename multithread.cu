@@ -14,25 +14,55 @@ void generate_random_numbers(int *array, int num_elements, int seed) {
 }
 
 // CUDA kernel for sorting each bucket using Thrust
-__global__ void sort_buckets(int *buckets, int *bucket_offsets, int num_buckets, int bucket_size) {
-    int bid = blockIdx.x;
-    int tid = threadIdx.x;
+__global__ void mergeSort(int* array, int* temp, int size) 
+{
+    
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    for (int width = 1; width < size; width *= 2) 
+    {
+        if (tid < size) 
+        {
+            int left = tid * 2 * width;
+            int mid = min(left + width - 1, size - 1);
+            int right = min(left + 2 * width - 1, size - 1);
 
-    // Determine the start and end index for the current bucket
-    int start_idx = bucket_offsets[bid];
-    int end_idx = (bid == num_buckets - 1) ? bucket_size : bucket_offsets[bid + 1];
+            if (left <= right) 
+            {
+                int i = left;
+                int j = mid + 1;
+                int k = left;
 
-    // Sort the bucket using Bubble Sort (You can replace this with Thrust sort for better performance)
-    for (int i = start_idx; i < end_idx - 1; ++i) {
-        for (int j = start_idx; j < end_idx - 1 - (i - start_idx); ++j) {
-            if (buckets[j] > buckets[j + 1]) {
-                int temp = buckets[j];
-                buckets[j] = buckets[j + 1];
-                buckets[j + 1] = temp;
+                while (i <= mid && j <= right) 
+                {
+                    if (array[i] <= array[j]) 
+                    {
+                        temp[k++] = array[i++];
+                    }
+                     else 
+                    {
+                        temp[k++] = array[j++];
+                    }
+                }
+                while (i <= mid) 
+                {
+                    temp[k++] = array[i++];
+                }
+
+                while (j <= right) 
+                {
+                    temp[k++] = array[j++];
+                }
+
+                for (i = left; i <= right; i++) 
+                {
+                    array[i] = temp[i];
+                }
             }
         }
+        __syncthreads();
     }
 }
+
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
@@ -91,7 +121,7 @@ int main(int argc, char* argv[]) {
      **********************************/
 
     // Sort each bucket using CUDA kernel
-    sort_buckets<<<num_buckets, threads_per_block>>>(device_data, device_bucket_offsets, num_buckets, num_elements);
+    mergeSort<<<num_buckets, threads_per_block>>>(device_data, device_bucket_offsets, num_elements);
 
     /***********************************
      *
