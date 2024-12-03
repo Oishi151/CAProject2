@@ -1,156 +1,162 @@
 #include <iostream>
-#include <cstdlib>
-#include <cuda.h>
-#include <vector>
-#include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <cuda_runtime.h>
+using namespace std;
 
-#define BLOCK_SIZE 256
+// Macro definitions for CUDA error checking
+#define CUDA_CHECK_ERROR
+#define CudaSafeCall( err ) __cudaSafeCall( err, __FILE__, __LINE__ )
+#define CudaCheckError() __cudaCheckError( __FILE__, __LINE__ )
 
-// CUDA error checking macro
-#define CUDA_CHECK(err) { \
-    if (err != cudaSuccess) { \
-        std::cerr << "CUDA Error: " << cudaGetErrorString(err) << std::endl; \
-        exit(1); \
-    } \
+// Error handling for CUDA calls
+inline void __cudaSafeCall(cudaError err, const char *file, const int line) {
+    #ifdef CUDA_CHECK_ERROR
+    if (cudaSuccess != err) {
+        fprintf(stderr, "cudaSafeCall() failed at %s:%i : %s\n", file, line, cudaGetErrorString(err));
+        exit(-1);
+    }
+    #endif
 }
 
-// Kernel for counting the occurrences of each bit
-__global__ void countKernel(int* input, int* counts, int n, int bit) {
-    __shared__ int localCounts[2 * BLOCK_SIZE];
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
-    localCounts[threadIdx.x] = 0;
-    localCounts[threadIdx.x + BLOCK_SIZE] = 0;
-
-    if (tid < n) {
-        int value = input[tid];
-        int bin = (value >> bit) & 1;
-        atomicAdd(&localCounts[bin * BLOCK_SIZE + threadIdx.x], 1);
+inline void __cudaCheckError(const char *file, const int line) {
+    #ifdef CUDA_CHECK_ERROR
+    cudaError_t err = cudaGetLastError();
+    if (cudaSuccess != err) {
+        fprintf(stderr, "cudaCheckError() failed at %s:%i : %s.\n", file, line, cudaGetErrorString(err));
+        exit(-1);
     }
-    __syncthreads();
-
-    // Sum counts into global memory
-    if (threadIdx.x < 2) {
-        int sum = 0;
-        for (int i = 0; i < BLOCK_SIZE; ++i) {
-            sum += localCounts[i + threadIdx.x * BLOCK_SIZE];
-        }
-        atomicAdd(&counts[threadIdx.x], sum);
+    err = cudaDeviceSynchronize();
+    if (cudaSuccess != err) {
+        fprintf(stderr, "cudaCheckError() with sync failed at %s:%i : %s.\n", file, line, cudaGetErrorString(err));
+        exit(-1);
     }
+    #endif
 }
 
-// Kernel for prefix sum (scan) computation
-__global__ void scanKernel(int* counts, int* offsets, int n) {
-    __shared__ int temp[2];
-    int tid = threadIdx.x;
-
-    if (tid < 2) {
-        temp[tid] = counts[tid];
-    }
-    __syncthreads();
-
-    if (tid == 1) {
-        offsets[1] = temp[0];
-    }
-    if (tid == 0) {
-        offsets[0] = 0;
-    }
-    __syncthreads();
-}
-
-// Kernel for scattering elements into sorted positions
-__global__ void scatterKernel(int* input, int* output, int* offsets, int n, int bit) {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
-    if (tid < n) {
-        int value = input[tid];
-        int bin = (value >> bit) & 1;
-
-        int index = atomicAdd(&offsets[bin], 1);
-        output[index] = value;
-    }
-}
-
-int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " [number of random integers to generate] [seed value for random number generation]\n";
-        return 1;
-    }
-
-    int num_elements = std::atoi(argv[1]);
-    int seed = std::atoi(argv[2]);
-
-    // Generate random numbers on the host
-    std::vector<int> host_input(num_elements);
+// Function to generate random array of integers
+int* makeRandArray(const int size, const int seed) {
     srand(seed);
-    for (int i = 0; i < num_elements; ++i) {
-        host_input[i] = rand();
+    int *array = new int[size];
+    for (int i = 0; i < size; ++i) {
+        array[i] = rand() % 100000; // Random integers between 0 and 99,999
     }
-
-    // Allocate device memory
-    int *device_input, *device_output, *device_counts, *device_offsets;
-    CUDA_CHECK(cudaMalloc(&device_input, num_elements * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&device_output, num_elements * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&device_counts, 2 * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&device_offsets, 2 * sizeof(int)));
-
-    // Copy input data to device
-    CUDA_CHECK(cudaMemcpy(device_input, host_input.data(), num_elements * sizeof(int), cudaMemcpyHostToDevice));
-
-    // Define block and grid sizes
-    int threads_per_block = BLOCK_SIZE;
-    int blocks_per_grid = (num_elements + threads_per_block - 1) / threads_per_block;
-
-    // CUDA timer
-    cudaEvent_t start, stop;
-    float elapsed_time;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-    CUDA_CHECK(cudaEventRecord(start, 0));
-
-    // Perform radix sort (32-bit integers, 32 iterations)
-    for (int bit = 0; bit < 32; ++bit) {
-        // Reset counts
-        CUDA_CHECK(cudaMemset(device_counts, 0, 2 * sizeof(int)));
-
-        // Count occurrences of each bit
-        countKernel<<<blocks_per_grid, threads_per_block>>>(device_input, device_counts, num_elements, bit);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // Compute offsets
-        scanKernel<<<1, 2>>>(device_counts, device_offsets, 2);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // Scatter elements into sorted positions
-        scatterKernel<<<blocks_per_grid, threads_per_block>>>(device_input, device_output, device_offsets, num_elements, bit);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // Swap input and output
-        std::swap(device_input, device_output);
-    }
-
-    // Stop timer
-    CUDA_CHECK(cudaEventRecord(stop, 0));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    CUDA_CHECK(cudaEventElapsedTime(&elapsed_time, start, stop));
-
-    // Copy sorted data back to host
-    CUDA_CHECK(cudaMemcpy(host_input.data(), device_input, num_elements * sizeof(int), cudaMemcpyDeviceToHost));
-
-    std::cerr << "Elapsed time: " << elapsed_time / 1000.0f << " seconds" << std::endl;
-
-    // Validate sorting
-    if (std::is_sorted(host_input.begin(), host_input.end())) {
-        std::cout << "Array sorted successfully." << std::endl;
-    } else {
-        std::cerr << "Sorting failed!" << std::endl;
-    }
-
-    // Free device memory
-    cudaFree(device_input);
-    cudaFree(device_output);
-    cudaFree(device_counts);
-    cudaFree(device_offsets);
-
-    return 0;
+    return array;
 }
+
+// CUDA Kernel for parallel merge sort
+const int MAX_THREADS_PER_BLOCK = 1024;
+
+__global__ void mergeSort(int* array, int* temp, int size) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    // Ensure tid is within bounds
+    if (tid >= size) return;
+
+    // Iterative merge sort
+    for (int width = 1; width < size; width *= 2) {
+        int left = tid * 2 * width;
+        int mid = min(left + width - 1, size - 1);
+        int right = min(left + 2 * width - 1, size - 1);
+
+        // Check for valid ranges
+        if (left >= size) return;
+
+        int i = left, j = mid + 1, k = left;
+
+        // Merge the two halves
+        while (i <= mid && j <= right) {
+            if (array[i] <= array[j]) {
+                temp[k++] = array[i++];
+            } else {
+                temp[k++] = array[j++];
+            }
+        }
+
+        while (i <= mid) {
+            temp[k++] = array[i++];
+        }
+
+        while (j <= right) {
+            temp[k++] = array[j++];
+        }
+
+        for (i = left; i <= right; i++) {
+            array[i] = temp[i];
+        }
+
+        __syncthreads();
+    }
+}
+
+int main() {
+    const int seed = 42; // Fixed seed for reproducibility
+
+    const int step = 50000;
+    const int maxSize = 300000;
+    const int minSize = 50000;
+
+    // Open the CSV file for appending
+    ofstream csvFile("MultiThread.csv", ios::app);
+    if (!csvFile.is_open()) {
+        cerr << "Error opening CSV file for writing!" << endl;
+        return -1;
+    }
+
+    // Write the header only if the file is empty (first time run)
+    if (csvFile.tellp() == 0) {
+        csvFile << "Array Size,Time (seconds)" << endl;
+    }
+
+    for (int size = minSize; size <= maxSize; size += step) {
+        cout << "Running merge sort for array size: " << size << endl;
+
+        int *array = makeRandArray(size, seed); // Generate random array
+
+        int *d_array, *d_temp;
+        int numBlocks = (size + MAX_THREADS_PER_BLOCK - 1) / MAX_THREADS_PER_BLOCK;
+
+        // Allocate memory on GPU
+        CudaSafeCall(cudaMalloc((void**)&d_array, size * sizeof(int)));
+        CudaSafeCall(cudaMalloc((void**)&d_temp, size * sizeof(int)));
+
+        // Copy data to GPU
+        CudaSafeCall(cudaMemcpy(d_array, array, size * sizeof(int), cudaMemcpyHostToDevice));
+        CudaSafeCall(cudaDeviceSynchronize());
+        // Timer setup
+        cudaEvent_t startTotal, stopTotal;
+        float timeTotal;
+        cudaEventCreate(&startTotal);
+        cudaEventCreate(&stopTotal);
+        cudaEventRecord(startTotal, 0);
+
+        // Launch mergeSort kernel
+        mergeSort<<<numBlocks, MAX_THREADS_PER_BLOCK>>>(d_array, d_temp, size);
+cudaDeviceSynchronize();
+        CudaCheckError();
+
+        // Timer stop
+        cudaEventRecord(stopTotal, 0);
+        cudaEventSynchronize(stopTotal);
+        cudaEventElapsedTime(&timeTotal, startTotal, stopTotal);
+        cudaEventDestroy(startTotal);
+        cudaEventDestroy(stopTotal);
+
+        cerr << "Total time in seconds for size " << size << ": " << timeTotal / 1000.0 << endl;
+
+        // Append results to CSV
+        csvFile << size << "," << timeTotal / 1000.0 << endl;
+
+        // Copy sorted array back to host
+        CudaSafeCall(cudaMemcpy(array, d_array, size * sizeof(int), cudaMemcpyDeviceToHost));
+        // Free allocated memory
+        delete[] array;
+        cudaFree(d_array);
+        cudaFree(d_temp);
+    }
+
+    // Close the CSV file
+    csvFile.close();
+    return 0;
+} 
