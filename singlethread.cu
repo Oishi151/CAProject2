@@ -1,30 +1,23 @@
 #include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
+#include <cstdlib>
 #include <cuda_runtime.h>
 using namespace std;
 
-// Macro definitions for CUDA error checking
-#define CUDA_CHECK_ERROR
 #define CudaSafeCall(err) __cudaSafeCall(err, __FILE__, __LINE__)
 #define CudaCheckError() __cudaCheckError(__FILE__, __LINE__)
 
-// Error handling for CUDA calls
+// CUDA error handling functions
 inline void __cudaSafeCall(cudaError err, const char *file, const int line)
 {
-#ifdef CUDA_CHECK_ERROR
     if (cudaSuccess != err)
     {
         fprintf(stderr, "cudaSafeCall() failed at %s:%i : %s\n", file, line, cudaGetErrorString(err));
         exit(-1);
     }
-#endif
 }
 
 inline void __cudaCheckError(const char *file, const int line)
 {
-#ifdef CUDA_CHECK_ERROR
     cudaError_t err = cudaGetLastError();
     if (cudaSuccess != err)
     {
@@ -37,137 +30,114 @@ inline void __cudaCheckError(const char *file, const int line)
         fprintf(stderr, "cudaCheckError() with sync failed at %s:%i : %s.\n", file, line, cudaGetErrorString(err));
         exit(-1);
     }
-#endif
 }
 
-// Function to generate random array of integers
-int *makeRandArray(const int size, const int seed)
-{
-    srand(seed);
-    int *array = new int[size];
-    for (int i = 0; i < size; ++i)
-    {
-        array[i] = rand() % 100000; // Random integers between 0 and 99,999
-    }
-    return array;
-}
-
-// CUDA Kernel for parallel merge sort
+// CUDA kernel for single-threaded merge sort
 __global__ void mergeSort(int *array, int *temp, int size)
 {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
-    // Ensure tid is within bounds
-    if (tid >= size)
+    // Ensure only one thread executes the sorting
+    if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
 
     // Iterative merge sort
     for (int width = 1; width < size; width *= 2)
     {
-        int left = tid * 2 * width;
-        int mid = min(left + width - 1, size - 1);
-        int right = min(left + 2 * width - 1, size - 1);
-
-        // Check for valid ranges
-        if (left >= size)
-            return;
-
-        int i = left, j = mid + 1, k = left;
-
-        // Merge the two halves
-        while (i <= mid && j <= right)
+        for (int i = 0; i < size; i += 2 * width)
         {
-            if (array[i] <= array[j])
+            int left = i;
+            int mid = min(i + width - 1, size - 1);
+            int right = min(i + 2 * width - 1, size - 1);
+
+            // Merge the two halves
+            int l = left, r = mid + 1, k = left;
+            while (l <= mid && r <= right)
             {
-                temp[k++] = array[i++];
+                if (array[l] <= array[r])
+                {
+                    temp[k++] = array[l++];
+                }
+                else
+                {
+                    temp[k++] = array[r++];
+                }
             }
-            else
+            while (l <= mid)
             {
-                temp[k++] = array[j++];
+                temp[k++] = array[l++];
+            }
+            while (r <= right)
+            {
+                temp[k++] = array[r++];
+            }
+
+            // Copy back to the original array
+            for (int j = left; j <= right; ++j)
+            {
+                array[j] = temp[j];
             }
         }
-
-        while (i <= mid)
-        {
-            temp[k++] = array[i++];
-        }
-
-        while (j <= right)
-        {
-            temp[k++] = array[j++];
-        }
-
-        for (i = left; i <= right; i++)
-        {
-            array[i] = temp[i];
-        }
-
-        __syncthreads();
     }
 }
 
 int main(int argc, char *argv[])
 {
-    int size, seed;
     if (argc < 3)
     {
-        std::cerr << "usage: "
-                  << argv[0]
-                  << " [amount of random nums to generate] [seed value for rand]"
-                  << std::endl;
-        exit(-1);
+        cerr << "Usage: " << argv[0] << " <size> <seed>" << endl;
+        return -1;
     }
 
-    // convert cstrings to ints
+    int size = atoi(argv[1]);
+    int seed = atoi(argv[2]);
+    srand(seed);
+
+    // Allocate and initialize the host array
+    int *array = new int[size];
+    for (int i = 0; i < size; ++i)
     {
-        std::stringstream ss1(argv[1]);
-        ss1 >> size;
+        array[i] = rand() % 10000; // Random values between 0 and 9999
     }
-
-    {
-        std::stringstream ss1(argv[2]);
-        ss1 >> seed;
-    }
-
-    cout << "Running merge sort for array size: " << size << endl;
-
-    int *array = makeRandArray(size, seed); // Generate random array
 
     int *d_array, *d_temp;
 
-    // Allocate memory on GPU
+    // Allocate memory on the device
     CudaSafeCall(cudaMalloc((void **)&d_array, size * sizeof(int)));
     CudaSafeCall(cudaMalloc((void **)&d_temp, size * sizeof(int)));
 
-    // Copy data to GPU
+    // Copy the array to the device
     CudaSafeCall(cudaMemcpy(d_array, array, size * sizeof(int), cudaMemcpyHostToDevice));
-    CudaSafeCall(cudaDeviceSynchronize());
-    // Timer setup
-    cudaEvent_t startTotal, stopTotal;
-    float timeTotal;
-    cudaEventCreate(&startTotal);
-    cudaEventCreate(&stopTotal);
-    cudaEventRecord(startTotal, 0);
 
-    // Launch mergeSort kernel
+    // Timer setup
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start, 0); // Start timing
+
+    // Launch the kernel with a single thread
     mergeSort<<<1, 1>>>(d_array, d_temp, size);
-    cudaDeviceSynchronize();
     CudaCheckError();
 
-    // Timer stop
-    cudaEventRecord(stopTotal, 0);
-    cudaEventSynchronize(stopTotal);
-    cudaEventElapsedTime(&timeTotal, startTotal, stopTotal);
-    cudaEventDestroy(startTotal);
-    cudaEventDestroy(stopTotal);
+    cudaEventRecord(stop, 0); // Stop timing
+    cudaEventSynchronize(stop);
 
-    cerr << "Total time in seconds for size " << size << ": " << timeTotal / 1000.0 << endl;
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
-    // Copy sorted array back to host
+    // Copy the sorted array back to the host
     CudaSafeCall(cudaMemcpy(array, d_array, size * sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Display the sorted array
+   
+    // Print time taken
+    cout << "Time taken for sorting: " << milliseconds / 1000.0 << " seconds" << endl;
+
     // Free allocated memory
     delete[] array;
     cudaFree(d_array);
     cudaFree(d_temp);
+
     return 0;
 }
